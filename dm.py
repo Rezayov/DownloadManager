@@ -71,6 +71,20 @@ except ImportError:
 VERSION = "2.1.0"
 
 
+DOWNLOAD_EXTENSIONS = {
+    "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "tgz", "tbz2",
+    "exe", "msi", "deb", "rpm", "dmg", "pkg", "appimage", "apk",
+    "iso", "img",
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf", "csv",
+    "txt", "md", "log",
+    "mp3", "wav", "ogg", "flac", "aac", "m4a", "opus",
+    "mp4", "mkv", "avi", "mov", "webm", "flv", "wmv", "m4v", "mpg", "mpeg",
+    "png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "ico", "tiff",
+    "bin", "dat", "json", "xml", "yaml", "yml", "toml", "ini", "cfg",
+    "jar", "war", "whl", "egg", "gz",
+}
+
+
 DEFAULT_CONFIG = {
     "download_dir": "~/Downloads/Manager",
     "log_dir": "~/Downloads/Manager/logs",
@@ -377,8 +391,12 @@ def validate_url(url: str) -> None:
 
 def safe_filename(name: str) -> str:
     name = unquote(name).strip().replace("\x00", "")
-    name = os.path.basename(name)
-    name = re.sub(r"[/:]+", "_", name)
+    name = name.split("?", 1)[0].split("#", 1)[0]
+    name = name.replace("\\", "/").split("/")[-1]
+    if name in {".", ".."} or name.startswith(".."):
+        name = name.lstrip(".")
+    name = re.sub(r"[\x00-\x1f\s/:]+", "_", name)
+    name = re.sub(r"_+", "_", name).strip("_")
     return name or "download"
 
 
@@ -523,6 +541,18 @@ class DownloadManager:
             + list(self.failed_tasks.values())
             + list(self.completed_tasks.values())
         )
+
+    def find_task(self, url: str) -> Optional[DownloadTask]:
+        url = url.strip()
+        if not url:
+            return None
+        with self.task_lock:
+            return (
+                self.pending_tasks.get(url)
+                or self.active_tasks.get(url)
+                or self.failed_tasks.get(url)
+                or self.completed_tasks.get(url)
+            )
 
     def _index_tasks(self) -> List[DownloadTask]:
         with self.task_lock:
@@ -1394,13 +1424,20 @@ class DownloadManager:
                     f.write(t.url + "\n")
         print(f"Exported {len(tasks)} task(s) to {filepath}")
 
-    def search_and_add_links(self, source: str, output_dir: Optional[str] = None, priority: int = 5) -> Tuple[int, List[str]]:
+    def search_and_add_links(
+        self,
+        source: str,
+        output_dir: Optional[str] = None,
+        priority: int = 5,
+        base_url_override: Optional[str] = None,
+        filter_extensions: bool = True,
+    ) -> Tuple[int, List[str]]:
         if source.startswith(("http://", "https://")):
             try:
                 resp = self.session.get(source, timeout=15)
                 resp.raise_for_status()
                 content = resp.text
-                base_url = source
+                base_url = base_url_override or source
             except Exception as e:
                 return 0, [f"Failed to fetch URL: {e}"]
         else:
@@ -1409,9 +1446,20 @@ class DownloadManager:
             try:
                 with open(source, "r", encoding="utf-8") as f:
                     content = f.read()
-                base_url = None
+                base_url = base_url_override
             except Exception as e:
                 return 0, [f"Failed to read file: {e}"]
+
+        if base_url is None:
+            base_match = re.search(
+                r"<base\s+[^>]*href\s*=\s*[\"']([^\"']+)[\"']",
+                content,
+                re.IGNORECASE,
+            )
+            if base_match:
+                cand = base_match.group(1).strip()
+                if cand.startswith(("http://", "https://")):
+                    base_url = cand
 
         raw_links: Set[str] = set()
         try:
@@ -1440,14 +1488,45 @@ class DownloadManager:
             link = link.strip()
             if not link:
                 continue
-            if base_url and not link.startswith(("http://", "https://")):
-                link = urljoin(base_url, link)
+            if link.startswith(("mailto:", "javascript:", "ftp:", "ftp://", "#")):
+                continue
             if link.startswith(("http://", "https://")):
                 absolute_links.add(link)
+                continue
+            if base_url:
+                resolved = urljoin(base_url, link)
+                if resolved.startswith(("http://", "https://")):
+                    absolute_links.add(resolved)
+                continue
+            if link.startswith("//"):
+                absolute_links.add("https:" + link)
+
+        def _has_download_extension(url: str) -> bool:
+            path = urlparse(url).path
+            if not path:
+                return False
+            ext = os.path.splitext(path)[1].lstrip(".").lower()
+            return bool(ext) and ext in DOWNLOAD_EXTENSIONS
+
+        filtered: Set[str] = set()
+        skipped_non_download: Set[str] = set()
+        for url in sorted(absolute_links):
+            if filter_extensions and not _has_download_extension(url):
+                skipped_non_download.add(url)
+                continue
+            filtered.add(url)
+
+        if skipped_non_download:
+            self.logger.info(
+                f"Filter skipped {len(skipped_non_download)} non-download link(s)"
+            )
 
         added, errors = 0, []
-        for url in sorted(absolute_links):
+        for url in filtered:
             try:
+                if self.find_task(url) is not None:
+                    self.logger.info(f"Skipped (duplicate): {url}")
+                    continue
                 dest = None
                 if output_dir:
                     filename = safe_filename(os.path.basename(urlparse(url).path)) or "download"
@@ -1558,6 +1637,15 @@ def create_parser() -> argparse.ArgumentParser:
     se.add_argument("source")
     se.add_argument("--output-dir", "-o")
     se.add_argument("--priority", "-p", type=int, default=5)
+    se.add_argument(
+        "--base-url",
+        help="Base URL for resolving relative links in local HTML files",
+    )
+    se.add_argument(
+        "--no-filter",
+        action="store_true",
+        help="Disable extension-based filtering (add all http(s) links)",
+    )
 
     exp = sub.add_parser("export", help="Export all non-completed tasks to a file")
     exp.add_argument("file")
@@ -1612,13 +1700,17 @@ def main() -> None:
 
     try:
         if args.command == "add":
-            task = manager.add_download(
-                args.url,
-                dest_path=args.output_file,
-                priority=args.priority,
-                expected_checksum=args.checksum,
-                checksum_algo=args.algo,
-            )
+            try:
+                task = manager.add_download(
+                    args.url,
+                    dest_path=args.output_file,
+                    priority=args.priority,
+                    expected_checksum=args.checksum,
+                    checksum_algo=args.algo,
+                )
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                raise SystemExit(1)
             print(f"Added: {task.url} -> {task.dest_path}")
 
         elif args.command == "add-list":
@@ -1633,6 +1725,10 @@ def main() -> None:
                         continue
                     try:
                         validate_url(url)
+                        if manager.find_task(url) is not None:
+                            print(f"Skipped (duplicate): {url}")
+                            skipped += 1
+                            continue
                         dest = None
                         if args.output_dir:
                             filename = safe_filename(os.path.basename(urlparse(url).path)) or "download"
@@ -1672,7 +1768,13 @@ def main() -> None:
                 print(f"  {e}")
 
         elif args.command == "search":
-            added, errs = manager.search_and_add_links(args.source, args.output_dir, args.priority)
+            added, errs = manager.search_and_add_links(
+                args.source,
+                args.output_dir,
+                args.priority,
+                base_url_override=args.base_url,
+                filter_extensions=not args.no_filter,
+            )
             print(f"\nAdded {added} link(s).")
             for e in errs:
                 print(f"  {e}")

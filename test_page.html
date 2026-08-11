@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Test Page for Link Extraction</title>
+</head>
+<body>
+    <h1>Download Links Test Page</h1>
+
+    <h2>Direct Download Links</h2>
+    <ul>
+        <li><a href="https://downloads.example.com/software/installer_v1.0.exe">Download Installer v1.0</a></li>
+        <li><a href="https://downloads.example.com/software/installer_v2.0.exe">Download Installer v2.0</a></li>
+        <li><a href="/downloads/manual.pdf">Download Manual (relative)</a></li>
+    </ul>
+
+    <h2>Media Links</h2>
+    <video src="https://cdn.example.com/videos/intro.mp4" controls></video>
+    <audio src="https://cdn.example.com/audio/background.ogg" controls></audio>
+
+    <h2>Source Tags</h2>
+    <video controls>
+        <source src="https://cdn.example.com/videos/backup.mp4" type="video/mp4">
+    </video>
+
+    <h2>Image Links (should be extracted)</h2>
+    <img src="https://cdn.example.com/images/logo.png" alt="Logo">
+    <img src="/images/icon.svg" alt="Icon (relative)">
+
+    <h2>External Links (should be filtered out - not downloads)</h2>
+    <ul>
+        <li><a href="https://external-site.com/page">External Page</a></li>
+        <li><a href="https://github.com/project/repo">GitHub Repository</a></li>
+    </ul>
+
+    <h2>Duplicate Links (should be deduplicated)</h2>
+    <ul>
+        <li><a href="https://downloads.example.com/software/installer_v1.0.exe">Installer v1.0 (duplicate)</a></li>
+        <li><a href="https://cdn.example.com/videos/intro.mp4">Intro Video (duplicate)</a></li>
+    </ul>
+
+    <h2>Links with Different Protocols (should be filtered)</h2>
+    <ul>
+        <li><a href="ftp://files.example.com/data.zip">FTP File (should be filtered)</a></li>
+        <li><a href="mailto:admin@example.com">Email (should be filtered)</a></li>
+        <li><a href="javascript:void(0)">JavaScript (should be filtered)</a></li>
+    </ul>
+
+    <h2>Pathological Cases</h2>
+    <ul>
+        <li><a href="https://example.com/file with spaces.zip">File with spaces</a></li>
+        <li><a href="https://example.com/file%20encoded.zip">URL encoded filename</a></li>
+        <li><a href="https://example.com/../etc/passwd">Path traversal attempt</a></li>
+    </ul>
+</body>
+</html>

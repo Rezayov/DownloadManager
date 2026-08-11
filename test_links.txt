@@ -1,0 +1,15 @@
+# Test Links File - Imaginary Download URLs
+# Lines starting with # are comments and should be skipped
+
+https://example-downloads.com/files/document.pdf
+https://example-downloads.com/files/image.png
+https://example-downloads.com/files/archive.zip
+https://example-downloads.com/files/video.mp4
+https://example-downloads.com/files/audio.mp3
+https://another-site.org/downloads/setup.exe
+https://another-site.org/downloads/readme.txt
+https://mirror.example.net/repo/package.deb
+https://mirror.example.net/repo/package.rpm
+# This is a comment line and should be skipped
+https://invalid-domain-check.com/file1.bin
+https://duplicate-test.com/file duplication test.zip
