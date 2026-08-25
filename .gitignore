@@ -1,0 +1,6 @@
+# built binaries
+dm
+dist/
+
+__pycache__/
+*.pyc

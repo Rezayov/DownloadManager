@@ -129,6 +129,12 @@ python dm.py run 1-3
 # Add all links from a webpage
 python dm.py search https://example.com/page.html --output-dir ~/Downloads
 
+# Regex link hunting: only add links matching a pattern (Python re.search on the URL)
+python dm.py search https://example.com/library --pattern '\.mp4$'
+python dm.py search https://example.com/library --pattern 'season-?2' --exclude-pattern '(sample|trailer)'
+# Combine with --no-filter to catch extension-less links (e.g. /download?id=42)
+python dm.py search https://example.com/dl --pattern 'download\?id=' --no-filter
+
 # Retry all failed links from log
 python dm.py failures --retry
 
@@ -139,9 +145,70 @@ python dm.py run --config ~/myconfig.yaml
 python dm.py run --speed-limit 1048576
 ```
 
+### Where downloads go by default
+Unless you say otherwise, downloads are saved **in the directory you run dm
+from** (your current working directory). Override it with any of (highest
+priority first):
+
+1. `-o/--output-file` (`add`) or `-o/--output-dir` (`add-list`, `search`)
+2. `-d/--download-dir` (`add`, `add-list`, `search`, `run`)
+3. `DM_DOWNLOAD_DIR` environment variable
+4. `download_dir:` in `~/.config/dm/config.yaml`
+
+Central state, logs, and failure logs stay in their configured locations
+(`~/Downloads/Manager/...` by default) no matter where files land.
+
+### Authentication (proving your identity on protected domains)
+dm can save per-domain credentials so `add`, `add-list`, `search`, and `run`
+can download from links you are authorized for. Credentials live in
+`~/.config/dm/auth.json` (created with `0600` permissions) and all values
+support `${ENV_VAR}` references so secrets can stay out of files.
+
+```bash
+# Bearer / API token (recommended: reference an env var)
+export MY_TOKEN=ghp_xxxxxxxx
+dm auth add dl.example.com --type bearer --token '${MY_TOKEN}'
+
+# Arbitrary headers (repeatable)
+dm auth add api.example.com --type header --header 'X-Api-Key: 123456'
+
+# HTTP Basic auth (password prompted securely if omitted)
+dm auth add nas.local --type basic --username reza
+
+# Cookies: inline string or a cookies.txt exported from your browser
+dm auth add forum.example.com --type cookies --cookie 'session=abc; theme=dark'
+dm auth add tracker.example.com --type cookies --cookie-file ~/cookies.txt
+
+# Wildcards match subdomains; exact host beats wildcard beats parent domain
+dm auth add '*.example.com' --type bearer --token '${MY_TOKEN}'
+```
+
+Once saved, credentials apply automatically whenever a task's URL matches the
+domain — including page fetching for `search`:
+
+```bash
+# Finds links on pages that require login, then downloads them as you
+dm search https://dl.example.com/library -o ~/Downloads
+
+# Verify identity against any URL before downloading
+dm auth test https://dl.example.com/file.bin   # prints HTTP status + verdict
+dm auth list                                    # secrets shown masked
+dm auth remove dl.example.com
+```
+
+One-off credentials are also available without saving anything:
+`--cookie 'k=v'`, `--header 'Name: Value'` (repeatable), `--user USER:PASS`,
+and `--auth-domain DOMAIN` to force a specific profile. When used with
+`add`/`add-list`/`search`, one-off credentials are baked into those tasks so a
+later `dm run` keeps working. Stored profiles are never baked into tasks —
+they resolve fresh at request time, rotate safely, and never touch
+`state.json`. On 401/403 responses dm logs a hint telling you exactly which
+`dm auth add ...` command to run.
+
 ### Configuration
 Create `~/.config/dm/config.yaml`:
 ```yaml
+# download_dir defaults to the directory dm is invoked from if not set here
 download_dir: ~/Downloads
 max_concurrent: 4
 chunk_size: 524288
@@ -154,7 +221,7 @@ proxy: null
 checksum_verify: true
 ```
 
-Or set environment variables: `DM_MAX_CONCURRENT=8`, `DM_SPEED_LIMIT=2000000`
+Or set environment variables: `DM_MAX_CONCURRENT=8`, `DM_SPEED_LIMIT=2000000`, `DM_AUTH_FILE=~/.config/dm/auth.json`
 
 ---
 

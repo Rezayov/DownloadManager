@@ -14,13 +14,16 @@ Highlights:
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
+import getpass
 import hashlib
 import json
 import logging
 import os
 import re
 import signal
+import stat
 import sys
 import tempfile
 import threading
@@ -33,42 +36,77 @@ from queue import Empty, PriorityQueue
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import unquote, urljoin, urlparse
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-try:
-    import yaml
-except ImportError:  # optional dependency
-    yaml = None
-
 try:
     import fcntl
 except ImportError:  # non-POSIX fallback; macOS has fcntl
     fcntl = None
 
-try:
-    from rich.console import Console
-    from rich.live import Live
-    from rich.panel import Panel
-    from rich.progress import (
-        BarColumn,
-        Progress,
-        TaskID,
-        TextColumn,
-        TimeRemainingColumn,
-        TransferSpeedColumn,
-    )
-    from rich.table import Table
+# Heavy dependencies are imported lazily so lightweight commands (list, add,
+# auth, status, --version) do not pay ~0.4s of import time on every run.
+requests = None  # type: ignore[assignment]
+HTTPAdapter = None  # type: ignore[assignment]
+Retry = None  # type: ignore[assignment]
 
+
+def _ensure_http():
+    """Import requests (and its retry adapter pieces) on first network use."""
+    global requests, HTTPAdapter, Retry
+    if requests is not None:
+        return requests
+    import requests as _requests
+    from requests.adapters import HTTPAdapter as _HTTPAdapter
+    from urllib3.util.retry import Retry as _Retry
+
+    requests = _requests
+    HTTPAdapter = _HTTPAdapter
+    Retry = _Retry
+    return requests
+
+
+RICH_AVAILABLE = False
+Console = None  # type: ignore[assignment]
+Live = Panel = Progress = Table = None  # type: ignore[assignment]
+BarColumn = TextColumn = TimeRemainingColumn = TransferSpeedColumn = None  # type: ignore[assignment]
+TaskID = int  # type: ignore[assignment]
+
+
+def _load_rich() -> bool:
+    """Import rich on first TUI/table use; returns False if unavailable."""
+    global RICH_AVAILABLE, Console, Live, Panel, Progress, Table
+    global BarColumn, TextColumn, TimeRemainingColumn, TransferSpeedColumn, TaskID
+    if RICH_AVAILABLE:
+        return True
+    try:
+        from rich.console import Console as _Console
+        from rich.live import Live as _Live
+        from rich.panel import Panel as _Panel
+        from rich.progress import (
+            BarColumn as _BarColumn,
+            Progress as _Progress,
+            TaskID as _TaskID,
+            TextColumn as _TextColumn,
+            TimeRemainingColumn as _TimeRemainingColumn,
+            TransferSpeedColumn as _TransferSpeedColumn,
+        )
+        from rich.table import Table as _Table
+    except ImportError:
+        return False
+
+    Console = _Console
+    Live = _Live
+    Panel = _Panel
+    Progress = _Progress
+    Table = _Table
+    BarColumn = _BarColumn
+    TextColumn = _TextColumn
+    TimeRemainingColumn = _TimeRemainingColumn
+    TransferSpeedColumn = _TransferSpeedColumn
+    TaskID = _TaskID
     RICH_AVAILABLE = True
-except ImportError:
-    RICH_AVAILABLE = False
-    Console = None  # type: ignore
-    TaskID = int  # type: ignore
+    return True
 
 
-VERSION = "2.1.0"
+VERSION = "2.3.0"
 
 
 DOWNLOAD_EXTENSIONS = {
@@ -86,7 +124,9 @@ DOWNLOAD_EXTENSIONS = {
 
 
 DEFAULT_CONFIG = {
-    "download_dir": "~/Downloads/Manager",
+    # None = resolve to the caller's current working directory unless a
+    # config file, DM_DOWNLOAD_DIR, or --download-dir/-o overrides it.
+    "download_dir": None,
     "log_dir": "~/Downloads/Manager/logs",
     "state_file": "~/Downloads/Manager/state.json",
     "failed_log": "~/Downloads/Manager/failed_links.txt",
@@ -102,6 +142,7 @@ DEFAULT_CONFIG = {
     "checksum_verify": True,
     "segments": 1,
     "plugin_dir": "~/Downloads/Manager/plugins",
+    "auth_file": "~/.config/dm/auth.json",
     "update_check": False,
     "update_url": "https://api.github.com/repos/yourname/dm/releases/latest",
     "tui": True,
@@ -124,8 +165,10 @@ class Config:
             return
         with open(self.config_path, "r", encoding="utf-8") as f:
             if self.config_path.endswith((".yaml", ".yml")):
-                if yaml is None:
-                    raise ImportError("PyYAML is required for YAML config files")
+                try:
+                    import yaml
+                except ImportError as e:
+                    raise ImportError("PyYAML is required for YAML config files") from e
                 loaded = yaml.safe_load(f) or {}
             else:
                 loaded = json.load(f)
@@ -148,6 +191,7 @@ class Config:
             "DM_SEGMENTS": "segments",
             "DM_TIMEOUT": "timeout",
             "DM_STALL_TIMEOUT": "stall_timeout",
+            "DM_AUTH_FILE": "auth_file",
         }
         int_keys = {
             "max_concurrent",
@@ -167,6 +211,11 @@ class Config:
             self.data[key] = value
 
     def _expand_paths(self) -> None:
+        # Default download location is the directory dm was invoked from,
+        # unless a config file, DM_DOWNLOAD_DIR, or a CLI flag chose otherwise.
+        # Central state/logs stay in their configured locations.
+        if not self.data.get("download_dir"):
+            self.data["download_dir"] = os.getcwd()
         for key in ("download_dir", "log_dir", "state_file", "plugin_dir", "failed_log"):
             if self.data.get(key):
                 self.data[key] = os.path.expanduser(str(self.data[key]))
@@ -189,6 +238,339 @@ class Config:
         if name in self.data:
             return self.data[name]
         raise AttributeError(f"Config has no attribute '{name}'")
+
+
+# ----------------------------------------------------------------------
+# Authentication (per-domain identity profiles)
+# ----------------------------------------------------------------------
+class AuthError(Exception):
+    """Raised when an auth profile is missing, invalid, or incomplete."""
+
+
+def parse_cookie_string(value: str) -> Dict[str, str]:
+    """Parse a cookie header string like 'k=v; k2=v2' into a dict."""
+    cookies: Dict[str, str] = {}
+    for part in value.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, _, val = part.partition("=")
+        if name.strip():
+            cookies[name.strip()] = val.strip()
+    return cookies
+
+
+def mask_secret(value: Optional[str]) -> str:
+    """Mask a secret for display: keep at most first/last 4 chars."""
+    if not value:
+        return "(empty)"
+    if len(value) <= 8:
+        return "*" * max(4, len(value))
+    return f"{value[:4]}****{value[-4:]}"
+
+
+class AuthStore:
+    """
+    Per-domain credential profiles persisted to a 0600 JSON file.
+
+    Profile shapes by type:
+      bearer  -> {"type": "bearer", "token": "..."}
+      header  -> {"type": "header", "headers": {"X-Api-Key": "...", ...}}
+      basic   -> {"type": "basic", "username": "...", "password": "..."}
+      cookies -> {"type": "cookies", "cookie_string": "k=v; ..."} or {"cookie_file": "cookies.txt"}
+
+    All values support ${ENV_VAR} expansion so secrets can live in the
+    environment instead of on disk.
+    """
+
+    AUTH_TYPES = ("bearer", "header", "basic", "cookies")
+
+    def __init__(self, path: Optional[str] = None):
+        self.path = os.path.expanduser(path) if path else "~/.config/dm/auth.json"
+        if not os.path.isabs(self.path):
+            self.path = os.path.abspath(self.path)
+        self.profiles: Dict[str, Dict[str, Any]] = {}
+        self.load_error: Optional[str] = None
+        self._load()
+
+    # -- persistence ---------------------------------------------------
+    def _load(self) -> None:
+        self.load_error = None
+        self.profiles = {}
+        if not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("auth file must contain a JSON object")
+            for domain, profile in data.items():
+                if isinstance(profile, dict):
+                    self.profiles[str(domain).lower()] = profile
+            mode = stat.S_IMODE(os.stat(self.path).st_mode)
+            if mode & 0o077:
+                os.chmod(self.path, 0o600)
+        except Exception as e:
+            self.load_error = str(e)
+            self.profiles = {}
+
+    def save(self) -> None:
+        path = Path(self.path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = str(path) + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(self.profiles, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, self.path)
+
+    def require_ok(self) -> None:
+        if self.load_error:
+            raise AuthError(f"Cannot read auth store {self.path}: {self.load_error}")
+
+    # -- env-var expansion ----------------------------------------------
+    @staticmethod
+    def _expand(value: Any, context: str) -> Any:
+        if not isinstance(value, str):
+            return value
+
+        def repl(match: "re.Match[str]") -> str:
+            var = match.group(1)
+            resolved = os.environ.get(var)
+            if resolved is None:
+                raise AuthError(
+                    f"Environment variable '{var}' referenced by auth profile "
+                    f"'{context}' is not set"
+                )
+            return resolved
+
+        return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", repl, value)
+
+    def _profile(self, domain: str) -> Dict[str, Any]:
+        profile = self.profiles.get(domain)
+        if profile is None:
+            raise AuthError(f"No auth profile saved for '{domain}' (see `dm auth add`)")
+        return profile
+
+    def resolve(self, domain: str) -> Tuple[Dict[str, str], Dict[str, str], Optional[Tuple[str, str]]]:
+        """
+        Turn a stored profile into request artifacts.
+
+        Returns (extra_headers, cookies, basic_auth).
+        """
+        domain = domain.lower()
+        profile = self._profile(domain)
+        ptype = str(profile.get("type", "")).lower()
+        headers: Dict[str, str] = {}
+        cookies: Dict[str, str] = {}
+        basic: Optional[Tuple[str, str]] = None
+
+        raw_headers = profile.get("headers") or {}
+        if isinstance(raw_headers, dict):
+            for k, v in raw_headers.items():
+                headers[str(k)] = str(self._expand(v, domain))
+
+        if ptype == "bearer":
+            token = self._expand(profile.get("token"), domain)
+            if not token:
+                raise AuthError(f"Auth profile '{domain}' has an empty token")
+            headers["Authorization"] = f"Bearer {token}"
+        elif ptype == "basic":
+            user = str(self._expand(profile.get("username", ""), domain))
+            password = str(self._expand(profile.get("password", ""), domain))
+            basic = (user, password)
+        elif ptype == "cookies":
+            cookie_str = profile.get("cookie_string")
+            if cookie_str:
+                cookies.update(parse_cookie_string(str(self._expand(cookie_str, domain))))
+            cookie_file = profile.get("cookie_file")
+            if cookie_file:
+                cookies.update(self._load_cookie_file(str(self._expand(cookie_file, domain))))
+        elif ptype == "header":
+            pass
+        else:
+            raise AuthError(
+                f"Auth profile '{domain}' has unknown type '{ptype or '(none)'}' "
+                f"(expected one of {', '.join(self.AUTH_TYPES)})"
+            )
+
+        if not (headers or cookies or basic):
+            raise AuthError(f"Auth profile '{domain}' contains no usable credentials")
+        return headers, cookies, basic
+
+    @staticmethod
+    def _load_cookie_file(path: str) -> Dict[str, str]:
+        from http.cookiejar import MozillaCookieJar
+
+        jar = MozillaCookieJar(path)
+        try:
+            jar.load(ignore_discard=True, ignore_expires=True)
+        except FileNotFoundError as e:
+            raise AuthError(f"Cookie file not found: {path}") from e
+        except Exception as e:
+            raise AuthError(f"Failed to load cookie file {path}: {e}") from e
+        out: Dict[str, str] = {}
+        for cookie in jar:
+            out[cookie.name] = cookie.value or ""
+        return out
+
+    # -- CRUD ------------------------------------------------------------
+    def add(
+        self,
+        domain: str,
+        *,
+        type_: Optional[str] = None,
+        token: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        cookie_string: Optional[str] = None,
+        cookie_file: Optional[str] = None,
+    ) -> str:
+        self.require_ok()
+        domain = domain.strip().lower().rstrip(".")
+        if not domain:
+            raise AuthError("Domain must not be empty")
+
+        groups = sum(bool(x) for x in (token, headers, username is not None or password is not None, cookie_string or cookie_file))
+        if groups > 1:
+            raise AuthError("Provide only one credential kind: --token | --header | --username/--password | --cookie/--cookie-file")
+
+        if type_ is None:
+            if token:
+                type_ = "bearer"
+            elif headers:
+                type_ = "header"
+            elif username is not None or password is not None:
+                type_ = "basic"
+            elif cookie_string or cookie_file:
+                type_ = "cookies"
+            else:
+                raise AuthError("Nothing to store: use --token, --header, --username/--password, or --cookie/--cookie-file")
+        if type_ not in self.AUTH_TYPES:
+            raise AuthError(f"Unknown auth type '{type_}' (expected one of {', '.join(self.AUTH_TYPES)})")
+
+        profile: Dict[str, Any] = {"type": type_}
+        if type_ == "bearer":
+            if not token:
+                raise AuthError("--type bearer requires --token")
+            profile["token"] = token
+        elif type_ == "header":
+            if not headers:
+                raise AuthError("--type header requires at least one --header 'Name: Value'")
+            profile["headers"] = headers
+        elif type_ == "basic":
+            if username is None:
+                raise AuthError("--type basic requires --username")
+            if password is None:
+                raise AuthError("--type basic requires --password")
+            profile["username"] = username
+            profile["password"] = password
+        else:  # cookies
+            if bool(cookie_string) == bool(cookie_file):
+                raise AuthError("--type cookies requires exactly one of --cookie or --cookie-file")
+            if cookie_string:
+                profile["cookie_string"] = cookie_string
+            else:
+                profile["cookie_file"] = cookie_file
+
+        existed = domain in self.profiles
+        self.profiles[domain] = profile
+        self.save()
+        return f"{'Updated' if existed else 'Added'} auth profile for '{domain}' ({type_})"
+
+    def remove(self, domain: str) -> str:
+        self.require_ok()
+        domain = domain.strip().lower().rstrip(".")
+        if domain not in self.profiles:
+            raise AuthError(f"No auth profile saved for '{domain}'")
+        del self.profiles[domain]
+        self.save()
+        return f"Removed auth profile '{domain}'"
+
+    # -- matching ----------------------------------------------------------
+    def match(self, url: str) -> Optional[str]:
+        """
+        Best-matching stored domain for a URL.
+
+        Exact host beats wildcard ('*.example.com') beats bare parent domain;
+        longer matches beat shorter ones.
+        """
+        try:
+            host = urlparse(url).hostname
+        except Exception:
+            return None
+        if not host:
+            return None
+        host = host.lower().rstrip(".")
+        best: Optional[str] = None
+        best_score = -1
+        for domain in self.profiles:
+            d = domain.lower().lstrip(".")
+            if d.startswith("*."):
+                base = d[2:]
+                if host == base or host.endswith("." + base):
+                    score = 1000 + len(base)
+                else:
+                    continue
+            elif host == d:
+                score = 10000 + len(d)
+            elif host.endswith("." + d):
+                score = len(d)
+            else:
+                continue
+            if score > best_score:
+                best, best_score = domain, score
+        return best
+
+    # -- display -----------------------------------------------------------
+    def masked_view(self) -> List[Tuple[str, str]]:
+        rows: List[Tuple[str, str]] = []
+        for domain in sorted(self.profiles):
+            p = self.profiles[domain]
+            t = str(p.get("type", "?"))
+            detail = ""
+            if t == "bearer":
+                detail = f"token={mask_secret(p.get('token'))}"
+            elif t == "header":
+                detail = ", ".join(
+                    f"{k}={mask_secret(v)}" for k, v in sorted((p.get("headers") or {}).items())
+                )
+            elif t == "basic":
+                detail = f"user={p.get('username')} password={mask_secret(p.get('password'))}"
+            elif t == "cookies":
+                if p.get("cookie_string"):
+                    detail = f"{len(parse_cookie_string(str(p['cookie_string'])))} cookie(s) from string"
+                else:
+                    detail = f"file={p.get('cookie_file')}"
+            rows.append((domain, f"{t}: {detail}" if detail else t))
+        return rows
+
+    # -- parsing helpers -----------------------------------------------------
+    @staticmethod
+    def parse_header_args(header_args: Iterable[str]) -> Dict[str, str]:
+        headers: Dict[str, str] = {}
+        for item in header_args:
+            item = item.strip()
+            if ":" not in item:
+                raise AuthError(f"Invalid header '{item}' (expected 'Name: Value')")
+            name, _, value = item.partition(":")
+            if not name.strip():
+                raise AuthError(f"Invalid header '{item}' (empty name)")
+            headers[name.strip()] = value.strip()
+        return headers
+
+    @staticmethod
+    def parse_user_arg(user_arg: str) -> Tuple[str, str]:
+        user, sep, password = user_arg.partition(":")
+        if not sep:
+            raise AuthError("--user expects USER:PASS")
+        return user, password
+
+    @staticmethod
+    def basic_header(user: str, password: str) -> str:
+        raw = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+        return f"Basic {raw}"
 
 
 # ----------------------------------------------------------------------
@@ -438,7 +820,13 @@ def confirm(prompt: str, default: str = "n") -> bool:
 # Download manager core
 # ----------------------------------------------------------------------
 class DownloadManager:
-    def __init__(self, config: Config, logger: logging.Logger, install_signal_handlers: bool = True):
+    def __init__(
+        self,
+        config: Config,
+        logger: logging.Logger,
+        install_signal_handlers: bool = True,
+        auth_overrides: Optional[Dict[str, Any]] = None,
+    ):
         self.config = config
         self.logger = logger
         self.queue: PriorityQueue[Tuple[int, int, str]] = PriorityQueue()
@@ -455,8 +843,14 @@ class DownloadManager:
         self.state_lock = FileLock(self.state_file.with_suffix(self.state_file.suffix + ".lock"))
         self._sequence_counter = 0
 
-        self.session = self._create_session()  # for non-threaded metadata/search operations only
-        self.console = Console() if RICH_AVAILABLE and config.tui else None
+        self._session: Optional["requests.Session"] = None  # created on first network use
+        self.auth_store = AuthStore(getattr(config, "auth_file", None))
+        if self.auth_store.load_error:
+            logger.warning(
+                f"Ignoring unreadable auth store ({self.auth_store.path}): {self.auth_store.load_error}"
+            )
+        self.auth_overrides: Dict[str, Any] = auth_overrides or {}
+        self.console = Console() if config.tui and _load_rich() else None
         self.progress: Optional[Progress] = None
         self.task_ids: Dict[str, TaskID] = {}
 
@@ -486,7 +880,15 @@ class DownloadManager:
         signal.signal(signal.SIGINT, handler)
         signal.signal(signal.SIGTERM, handler)
 
-    def _create_session(self) -> requests.Session:
+    @property
+    def session(self) -> "requests.Session":
+        """Shared session for non-threaded metadata/search operations (lazy)."""
+        if self._session is None:
+            self._session = self._create_session()
+        return self._session
+
+    def _create_session(self) -> "requests.Session":
+        _ensure_http()
         session = requests.Session()
         retry = Retry(
             total=self.config.retries,
@@ -502,6 +904,88 @@ class DownloadManager:
         if self.config.proxy:
             session.proxies = {"http": self.config.proxy, "https": self.config.proxy}
         return session
+
+    # ------------------------------------------------------------------
+    # Authentication
+    # ------------------------------------------------------------------
+    def _oneoff_auth(self) -> Tuple[Dict[str, str], Dict[str, str], Optional[Tuple[str, str]]]:
+        """Per-invocation credentials from --header/--cookie/--user flags."""
+        ov = self.auth_overrides or {}
+        headers: Dict[str, str] = dict(ov.get("headers") or {})
+        cookies: Dict[str, str] = {}
+        for cs in ov.get("cookies") or []:
+            cookies.update(parse_cookie_string(str(cs)))
+        basic: Optional[Tuple[str, str]] = None
+        if ov.get("user"):
+            basic = AuthStore.parse_user_arg(str(ov["user"]))
+        return headers, cookies, basic
+
+    def _request_auth(
+        self, url: str, force_domain: Optional[str] = None
+    ) -> Tuple[Dict[str, str], Dict[str, str], Optional[Tuple[str, str]], Optional[str]]:
+        """
+        Resolve credentials for a URL.
+
+        Order: forced profile (--auth-domain) > stored profile matching the
+        URL's domain > nothing. One-off CLI credentials override stored ones.
+        Returns (headers, cookies, basic_auth, matched_profile_domain).
+        """
+        profile_headers: Dict[str, str] = {}
+        profile_cookies: Dict[str, str] = {}
+        profile_basic: Optional[Tuple[str, str]] = None
+        matched: Optional[str] = None
+
+        domain = force_domain or (self.auth_overrides or {}).get("auth_domain")
+        if domain:
+            matched = str(domain).lower()
+            profile_headers, profile_cookies, profile_basic = self.auth_store.resolve(matched)
+        else:
+            m = self.auth_store.match(url)
+            if m:
+                matched = m
+                profile_headers, profile_cookies, profile_basic = self.auth_store.resolve(m)
+
+        oneoff_headers, oneoff_cookies, oneoff_basic = self._oneoff_auth()
+        profile_headers.update(oneoff_headers)
+        profile_cookies.update(oneoff_cookies)
+        basic = oneoff_basic or profile_basic
+        return profile_headers, profile_cookies, basic, matched
+
+    def bake_oneoff_headers(self) -> Optional[Dict[str, str]]:
+        """
+        Serialize this invocation's one-off credentials into headers so a task
+        added now keeps them when `dm run` executes later. Stored profiles are
+        intentionally NOT baked (they are resolved fresh at request time).
+        """
+        oh, oc, ob = self._oneoff_auth()
+        baked = dict(oh)
+        if oc:
+            baked["Cookie"] = "; ".join(f"{k}={v}" for k, v in sorted(oc.items()))
+        if ob:
+            basic_value = AuthStore.basic_header(*ob)
+            if baked.get("Authorization") and baked["Authorization"] != basic_value:
+                self.logger.warning("--user overrides a custom Authorization header")
+            baked["Authorization"] = basic_value
+        return baked or None
+
+    @staticmethod
+    def _auth_hint(status_code: int, url: str, matched_domain: Optional[str]) -> str:
+        """A human-readable hint for 401/403 responses."""
+        if status_code not in (401, 403):
+            return ""
+        try:
+            host = urlparse(url).hostname or url
+        except Exception:
+            host = url
+        if matched_domain:
+            return (
+                f"HTTP {status_code}: saved credentials for '{matched_domain}' were rejected "
+                f"by {host}. Update them with: dm auth add {matched_domain} ..."
+            )
+        return (
+            f"HTTP {status_code}: no saved credentials match '{host}', so dm could not prove "
+            f"your identity. Save them with: dm auth add {host} (--type bearer|header|basic|cookies)"
+        )
 
     def _load_plugins(self) -> None:
         plugin_dir = Path(self.config.plugin_dir)
@@ -925,7 +1409,7 @@ class DownloadManager:
             print()
 
     def _start_tui(self) -> None:
-        if not RICH_AVAILABLE:
+        if not _load_rich():
             self._start_simple()
             return
         self.progress = Progress(
@@ -1062,8 +1546,16 @@ class DownloadManager:
     def _supports_range(self, url: str) -> bool:
         session = self._create_session()
         try:
-            headers = {"Range": "bytes=0-0"}
-            with session.get(url, headers=headers, stream=True, timeout=self.config.timeout) as r:
+            auth_headers, auth_cookies, basic, _matched = self._request_auth(url)
+            headers = {**auth_headers, "Range": "bytes=0-0"}
+            with session.get(
+                url,
+                headers=headers,
+                cookies=auth_cookies or None,
+                auth=basic,
+                stream=True,
+                timeout=self.config.timeout,
+            ) as r:
                 if r.status_code != 206:
                     return False
                 cr = parse_content_range(r.headers.get("Content-Range"))
@@ -1076,11 +1568,13 @@ class DownloadManager:
     def _single_download(self, task: DownloadTask) -> None:
         session = self._create_session()
         try:
+            auth_headers, auth_cookies, basic, matched_domain = self._request_auth(task.url)
             file_path = task.dest_path
             part_path = file_path + ".part"
             downloaded = os.path.getsize(part_path) if os.path.exists(part_path) else 0
             part_exists = downloaded > 0
-            headers = task.headers.copy()
+            # Task-level headers win over profile credentials (explicit beats stored).
+            headers = {**auth_headers, **task.headers}
             if downloaded > 0:
                 headers["Range"] = f"bytes={downloaded}-"
             task.bytes_downloaded = downloaded
@@ -1089,7 +1583,14 @@ class DownloadManager:
             for attempt in range(self.config.retries + 1):
                 mode = "ab" if downloaded > 0 else "wb"
                 try:
-                    with session.get(task.url, stream=True, headers=headers, timeout=self.config.timeout) as r:
+                    with session.get(
+                        task.url,
+                        stream=True,
+                        headers=headers,
+                        cookies=auth_cookies or None,
+                        auth=basic,
+                        timeout=self.config.timeout,
+                    ) as r:
                         if r.status_code == 416 and downloaded > 0:
                             # Local part may already equal the remote file. Verify via Content-Range */size if present.
                             cr_total = None
@@ -1103,6 +1604,9 @@ class DownloadManager:
                                 task.status = TaskStatus.COMPLETED
                                 return
                         if r.status_code not in (200, 206):
+                            hint = self._auth_hint(r.status_code, task.url, matched_domain)
+                            if hint:
+                                self.logger.error(hint)
                             r.raise_for_status()
 
                         if downloaded > 0 and r.status_code == 200:
@@ -1151,7 +1655,7 @@ class DownloadManager:
                     time.sleep(wait)
                     downloaded = os.path.getsize(part_path) if os.path.exists(part_path) else 0
                     task.bytes_downloaded = downloaded
-                    headers = task.headers.copy()
+                    headers = {**auth_headers, **task.headers}
                     if downloaded > 0:
                         headers["Range"] = f"bytes={downloaded}-"
                     task.update_progress_time()
@@ -1167,7 +1671,16 @@ class DownloadManager:
     def _remote_size_for_range_download(self, url: str) -> int:
         session = self._create_session()
         try:
-            with session.get(url, headers={"Range": "bytes=0-0"}, stream=True, timeout=self.config.timeout) as r:
+            auth_headers, auth_cookies, basic, _matched = self._request_auth(url)
+            headers = {**auth_headers, "Range": "bytes=0-0"}
+            with session.get(
+                url,
+                headers=headers,
+                cookies=auth_cookies or None,
+                auth=basic,
+                stream=True,
+                timeout=self.config.timeout,
+            ) as r:
                 if r.status_code != 206:
                     return 0
                 cr = parse_content_range(r.headers.get("Content-Range"))
@@ -1247,13 +1760,21 @@ class DownloadManager:
             return
         session = self._create_session()
         try:
-            headers = task.headers.copy()
+            auth_headers, auth_cookies, basic, _matched = self._request_auth(task.url)
+            headers = {**auth_headers, **task.headers}
             headers["Range"] = f"bytes={start}-{end}"
             expected_start = start
             for attempt in range(self.config.retries + 1):
                 mode = "ab" if initial_bytes > 0 and os.path.exists(part_path) else "wb"
                 try:
-                    with session.get(task.url, stream=True, headers=headers, timeout=self.config.timeout) as r:
+                    with session.get(
+                        task.url,
+                        stream=True,
+                        headers=headers,
+                        cookies=auth_cookies or None,
+                        auth=basic,
+                        timeout=self.config.timeout,
+                    ) as r:
                         if r.status_code != 206:
                             raise RuntimeError(f"Server did not honor Range request for segment {idx} (status {r.status_code})")
                         cr = parse_content_range(r.headers.get("Content-Range"))
@@ -1431,10 +1952,30 @@ class DownloadManager:
         priority: int = 5,
         base_url_override: Optional[str] = None,
         filter_extensions: bool = True,
+        url_pattern: Optional[str] = None,
+        url_exclude_pattern: Optional[str] = None,
     ) -> Tuple[int, List[str]]:
+        try:
+            include_re = re.compile(url_pattern) if url_pattern else None
+            exclude_re = re.compile(url_exclude_pattern) if url_exclude_pattern else None
+        except re.error as e:
+            return 0, [f"Invalid regex pattern: {e}"]
         if source.startswith(("http://", "https://")):
             try:
-                resp = self.session.get(source, timeout=15)
+                page_headers, page_cookies, page_basic, matched_domain = self._request_auth(source)
+            except AuthError as e:
+                return 0, [f"Authentication error: {e}"]
+            try:
+                resp = self.session.get(
+                    source,
+                    headers=page_headers or None,
+                    cookies=page_cookies or None,
+                    auth=page_basic,
+                    timeout=15,
+                )
+                if resp.status_code in (401, 403):
+                    hint = self._auth_hint(resp.status_code, source, matched_domain)
+                    return 0, [hint or f"Failed to fetch URL: HTTP {resp.status_code}"]
                 resp.raise_for_status()
                 content = resp.text
                 base_url = base_url_override or source
@@ -1510,16 +2051,34 @@ class DownloadManager:
 
         filtered: Set[str] = set()
         skipped_non_download: Set[str] = set()
+        skipped_pattern: Set[str] = set()
         for url in sorted(absolute_links):
+            if include_re and not include_re.search(url):
+                skipped_pattern.add(url)
+                continue
+            if exclude_re and exclude_re.search(url):
+                skipped_pattern.add(url)
+                continue
             if filter_extensions and not _has_download_extension(url):
                 skipped_non_download.add(url)
                 continue
             filtered.add(url)
 
+        if skipped_pattern:
+            self.logger.info(
+                f"Regex filter removed {len(skipped_pattern)} link(s)"
+            )
         if skipped_non_download:
             self.logger.info(
                 f"Filter skipped {len(skipped_non_download)} non-download link(s)"
             )
+
+        # One-off credentials from this invocation are baked into each task so
+        # a later `dm run` keeps them; stored profiles resolve fresh at run time.
+        try:
+            baked_headers = self.bake_oneoff_headers()
+        except AuthError as e:
+            return 0, [f"Authentication error: {e}"]
 
         added, errors = 0, []
         for url in filtered:
@@ -1531,7 +2090,7 @@ class DownloadManager:
                 if output_dir:
                     filename = safe_filename(os.path.basename(urlparse(url).path)) or "download"
                     dest = os.path.join(output_dir, filename)
-                task = self.add_download(url, dest_path=dest, priority=priority)
+                task = self.add_download(url, dest_path=dest, priority=priority, headers=baked_headers)
                 print(f"Added: {task.url} -> {task.dest_path}")
                 added += 1
             except Exception as e:
@@ -1542,6 +2101,7 @@ class DownloadManager:
         if not self.config.update_check:
             return
         try:
+            _ensure_http()
             resp = requests.get(self.config.update_url, timeout=5)
             resp.raise_for_status()
             latest = resp.json().get("tag_name")
@@ -1605,6 +2165,32 @@ def print_list(manager: DownloadManager, active_only=False, pending_only=False, 
 # ----------------------------------------------------------------------
 # CLI parser
 # ----------------------------------------------------------------------
+def _add_auth_flags(p: argparse.ArgumentParser, include_force: bool = True) -> None:
+    p.add_argument(
+        "--cookie",
+        action="append",
+        metavar='"K=V; K2=V2"',
+        help="Send these cookies for this invocation (repeatable)",
+    )
+    p.add_argument(
+        "--header",
+        action="append",
+        metavar='"NAME: VALUE"',
+        help="Send an extra header for this invocation (repeatable)",
+    )
+    p.add_argument(
+        "--user",
+        metavar="USER:PASS",
+        help="Use HTTP Basic authentication for this invocation",
+    )
+    if include_force:
+        p.add_argument(
+            "--auth-domain",
+            metavar="DOMAIN",
+            help="Force a saved auth profile by domain instead of URL matching (see `dm auth list`)",
+        )
+
+
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Download Manager (Index-Based)")
     parser.add_argument("--version", action="version", version=f"dm {VERSION}")
@@ -1613,14 +2199,26 @@ def create_parser() -> argparse.ArgumentParser:
     add_p = sub.add_parser("add", help="Add one URL")
     add_p.add_argument("url")
     add_p.add_argument("--output-file", "-o", dest="output_file", help="Destination file path")
+    add_p.add_argument(
+        "--download-dir",
+        "-d",
+        help="Directory to store downloads in (filename is appended); overrides the cwd default",
+    )
     add_p.add_argument("--priority", "-p", type=int, default=5)
     add_p.add_argument("--checksum")
     add_p.add_argument("--algo", default="sha256")
+    _add_auth_flags(add_p)
 
     al = sub.add_parser("add-list", help="Add URLs from a text file")
     al.add_argument("file")
     al.add_argument("--output-dir", "-o")
+    al.add_argument(
+        "--download-dir",
+        "-d",
+        help="Directory to store downloads in; overrides the cwd default",
+    )
     al.add_argument("--priority", "-p", type=int, default=5)
+    _add_auth_flags(al)
 
     rm = sub.add_parser("remove", help="Remove downloads by index pattern; default removes all after confirmation")
     rm.add_argument("patterns", nargs="*")
@@ -1636,6 +2234,11 @@ def create_parser() -> argparse.ArgumentParser:
     se = sub.add_parser("search", help="Search a webpage or HTML file for links and add them")
     se.add_argument("source")
     se.add_argument("--output-dir", "-o")
+    se.add_argument(
+        "--download-dir",
+        "-d",
+        help="Directory to store downloads in; overrides the cwd default",
+    )
     se.add_argument("--priority", "-p", type=int, default=5)
     se.add_argument(
         "--base-url",
@@ -1646,6 +2249,17 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable extension-based filtering (add all http(s) links)",
     )
+    se.add_argument(
+        "--pattern",
+        metavar="REGEX",
+        help="Only add links whose URL matches this regular expression (Python re.search)",
+    )
+    se.add_argument(
+        "--exclude-pattern",
+        metavar="REGEX",
+        help="Skip links whose URL matches this regular expression",
+    )
+    _add_auth_flags(se)
 
     exp = sub.add_parser("export", help="Export all non-completed tasks to a file")
     exp.add_argument("file")
@@ -1673,6 +2287,35 @@ def create_parser() -> argparse.ArgumentParser:
     run.add_argument("--speed-limit", type=int)
     run.add_argument("--segments", type=int)
     run.add_argument("--no-tui", action="store_true")
+    _add_auth_flags(run)
+
+    auth_p = sub.add_parser(
+        "auth",
+        help="Manage saved credentials so dm can prove your identity on protected domains",
+    )
+    auth_sub = auth_p.add_subparsers(dest="auth_command", required=True)
+
+    aa = auth_sub.add_parser("add", help="Add or update the credential profile for a domain")
+    aa.add_argument(
+        "domain",
+        help="Domain the credentials apply to, e.g. dl.example.com (wildcards like '*.example.com' are honored)",
+    )
+    aa.add_argument("--type", dest="auth_type", choices=list(AuthStore.AUTH_TYPES), help="Credential kind")
+    aa.add_argument("--token", metavar="TOKEN", help="Bearer/API token; supports ${ENV_VAR} references")
+    aa.add_argument("--header", action="append", metavar='"NAME: VALUE"', help="Custom header to send (repeatable)")
+    aa.add_argument("--username", help="Username for --type basic")
+    aa.add_argument("--password", help="Password for --type basic (omit to be prompted securely)")
+    aa.add_argument("--cookie", action="append", metavar='"K=V; K2=V2"', help="Cookie string (repeatable)")
+    aa.add_argument("--cookie-file", metavar="FILE", help="Netscape cookies.txt exported from your browser")
+
+    auth_sub.add_parser("list", help="List saved profiles with secrets masked")
+
+    ar = auth_sub.add_parser("remove", help="Remove the saved profile for a domain")
+    ar.add_argument("domain")
+
+    at = auth_sub.add_parser("test", help="Verify that dm can authenticate against a URL")
+    at.add_argument("url")
+    at.add_argument("--auth-domain", metavar="DOMAIN", help="Force a specific saved profile")
 
     return parser
 
@@ -1687,6 +2330,17 @@ def load_config(args: argparse.Namespace, cfg_path: Optional[str] = None) -> Con
     return config
 
 
+def build_auth_overrides(args: argparse.Namespace) -> Dict[str, Any]:
+    """Collect one-off credential flags into a dict for DownloadManager."""
+    header_args = getattr(args, "header", None) or []
+    return {
+        "cookies": list(getattr(args, "cookie", None) or []),
+        "headers": AuthStore.parse_header_args(header_args) if header_args else {},
+        "user": getattr(args, "user", None),
+        "auth_domain": getattr(args, "auth_domain", None),
+    }
+
+
 # ----------------------------------------------------------------------
 # CLI entry point
 # ----------------------------------------------------------------------
@@ -1696,17 +2350,114 @@ def main() -> None:
 
     config = load_config(args, getattr(args, "config", None))
     logger = setup_logging(config)
-    manager = DownloadManager(config, logger)
 
     try:
-        if args.command == "add":
+        auth_overrides = build_auth_overrides(args)
+    except AuthError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        raise SystemExit(1)
+
+    manager = DownloadManager(config, logger, auth_overrides=auth_overrides)
+
+    try:
+        if args.command == "auth":
+            store = manager.auth_store
+            if args.auth_command == "add":
+                password = args.password
+                if args.auth_type == "basic" and password is None and sys.stdin.isatty():
+                    password = getpass.getpass(f"Password for {args.username or 'user'}@{args.domain}: ")
+                try:
+                    message = store.add(
+                        args.domain,
+                        type_=args.auth_type,
+                        token=args.token,
+                        headers=AuthStore.parse_header_args(args.header or []),
+                        username=args.username,
+                        password=password,
+                        cookie_string="; ".join(args.cookie) if args.cookie else None,
+                        cookie_file=args.cookie_file,
+                    )
+                except AuthError as e:
+                    print(f"Error: {e}", file=sys.stderr)
+                    raise SystemExit(1)
+                print(message)
+
+            elif args.auth_command == "list":
+                store.require_ok()
+                rows = store.masked_view()
+                if not rows:
+                    print(f"No auth profiles saved in {store.path}")
+                    print("Save one with: dm auth add <domain> --type bearer --token TOKEN")
+                else:
+                    print(f"Saved auth profiles ({store.path}):")
+                    for domain, desc in rows:
+                        print(f"  {domain}")
+                        print(f"      {desc}")
+
+            elif args.auth_command == "remove":
+                try:
+                    print(store.remove(args.domain))
+                except AuthError as e:
+                    print(f"Error: {e}", file=sys.stderr)
+                    raise SystemExit(1)
+
+            elif args.auth_command == "test":
+                url = args.url
+                try:
+                    validate_url(url)
+                    headers, cookies, basic, matched = manager._request_auth(
+                        url, force_domain=getattr(args, "auth_domain", None)
+                    )
+                except (ValueError, AuthError) as e:
+                    print(f"Error: {e}", file=sys.stderr)
+                    raise SystemExit(1)
+                if not matched and not (headers or cookies or basic):
+                    host = urlparse(url).hostname or "<host>"
+                    print(f"No credentials apply to {url}.")
+                    print(f"Save some first: dm auth add {host} --type bearer --token TOKEN")
+                    raise SystemExit(2)
+                label = f"saved profile '{matched}'" if matched else "command-line credentials"
+                print(f"Proving identity against {url} using {label} ...")
+                try:
+                    resp = manager.session.get(
+                        url,
+                        headers=headers or None,
+                        cookies=cookies or None,
+                        auth=basic,
+                        timeout=config.timeout,
+                        stream=True,
+                    )
+                except requests.RequestException as e:
+                    print(f"Error: request failed: {e}", file=sys.stderr)
+                    raise SystemExit(1)
+                status = resp.status_code
+                ctype = resp.headers.get("Content-Type", "")
+                length = resp.headers.get("Content-Length", "?")
+                snippet = ""
+                if any(t in ctype.lower() for t in ("text", "json", "html", "xml")):
+                    chunk = next(resp.iter_content(chunk_size=400), b"") or b""
+                    snippet = chunk.decode(resp.encoding or "utf-8", errors="replace").strip()
+                resp.close()
+                print(f"HTTP {status} {resp.reason}  content-type={ctype or '?'}  length={length}")
+                if status in (200, 206):
+                    print("Identity accepted: dm can download from this domain as you.")
+                elif status in (401, 403):
+                    print("Identity REJECTED: the server did not accept these credentials.")
+                if snippet:
+                    preview = "\n".join(snippet.splitlines()[:6])[:400]
+                    print(f"--- response preview ---\n{preview}")
+                raise SystemExit(0 if status in (200, 206) else 3)
+
+        elif args.command == "add":
             try:
+                baked = manager.bake_oneoff_headers()
                 task = manager.add_download(
                     args.url,
                     dest_path=args.output_file,
                     priority=args.priority,
                     expected_checksum=args.checksum,
                     checksum_algo=args.algo,
+                    headers=baked,
                 )
             except ValueError as e:
                 print(f"Error: {e}", file=sys.stderr)
@@ -1718,6 +2469,7 @@ def main() -> None:
                 print(f"Error: File not found: {args.file}", file=sys.stderr)
                 raise SystemExit(1)
             added = skipped = 0
+            baked_headers = manager.bake_oneoff_headers()
             with open(args.file, "r", encoding="utf-8") as f:
                 for line_num, line in enumerate(f, 1):
                     url = line.strip()
@@ -1733,7 +2485,7 @@ def main() -> None:
                         if args.output_dir:
                             filename = safe_filename(os.path.basename(urlparse(url).path)) or "download"
                             dest = os.path.join(args.output_dir, filename)
-                        task = manager.add_download(url, dest_path=dest, priority=args.priority)
+                        task = manager.add_download(url, dest_path=dest, priority=args.priority, headers=baked_headers)
                         print(f"Added: {task.url} -> {task.dest_path}")
                         added += 1
                     except Exception as e:
@@ -1774,6 +2526,8 @@ def main() -> None:
                 args.priority,
                 base_url_override=args.base_url,
                 filter_extensions=not args.no_filter,
+                url_pattern=args.pattern,
+                url_exclude_pattern=args.exclude_pattern,
             )
             print(f"\nAdded {added} link(s).")
             for e in errs:
